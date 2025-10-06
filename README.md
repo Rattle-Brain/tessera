@@ -1,5 +1,7 @@
-# tessera
-Modular kernel written in zig
+# Tessera
+This is Tessera, a modular open-source kernel primarily for x86_64 systems. It's still a much-to-be-done work in progress, but I intend to make a small functional implementation.
+
+The main idea of this is to make a kernel written in Zig that has a very small core and several modules that can be, *ideally*, hot-loaded without needing to recompile the whole kernel code.
 
 ## Structure
 
