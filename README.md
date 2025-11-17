@@ -33,7 +33,7 @@ drivers/
 ## Building
 
 Requirements:
-- Zig compiler (0.11.0 or later)
+- Zig compiler (0.15.2 or later)
 - GNU Make (optional)
 - QEMU (for testing)
 
