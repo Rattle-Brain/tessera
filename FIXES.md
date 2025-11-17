@@ -4,18 +4,8 @@ Down below is a list of all the things wrong with the kernel so far.
 
 ## Compilation Issue
 
-**Critical**: Can't compile due to invalid ASM code.
+None. It compiles well.
 
-```bash
-  ⎿  Error: Exit code 1
-     install
-     +- install tessera.elf
-        +- compile exe tessera.elf Debug x86_64-freestanding-none 4 errors
-     src/arch/x86_64/gdt.zig:53:1: error: unknown size: '(%%rax)'
-     fn load() void {
-     ^~~~~~~~~~~~~~
-     src/arch/x86_64/idt.zig:46:1: error: unknown size: '(%%rax)'
-```
 ## Code Correctness Issues
 
 1. Boot Code - Architecture Mismatch (boot/boot.S:1-29)
