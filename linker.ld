@@ -2,31 +2,40 @@ ENTRY(_start)
 
 SECTIONS
 {
+    /* Load kernel at 1MB physical address */
     . = 1M;
 
+    /* Multiboot header must be in first 8KB */
     .boot :
     {
         *(.multiboot)
     }
 
-    .text ALIGN(4K) : AT(ADDR(.text) - 0xFFFFFFFF80000000)
+    /* Text section (code) */
+    .text ALIGN(4K) :
     {
         *(.text)
     }
 
-    .rodata ALIGN(4K) : AT(ADDR(.rodata) - 0xFFFFFFFF80000000)
+    /* Read-only data */
+    .rodata ALIGN(4K) :
     {
         *(.rodata)
     }
 
-    .data ALIGN(4K) : AT(ADDR(.data) - 0xFFFFFFFF80000000)
+    /* Initialized data */
+    .data ALIGN(4K) :
     {
         *(.data)
     }
 
-    .bss ALIGN(4K) : AT(ADDR(.bss) - 0xFFFFFFFF80000000)
+    /* Uninitialized data */
+    .bss ALIGN(4K) :
     {
         *(COMMON)
         *(.bss)
     }
+
+    /* Mark end of kernel for memory allocation */
+    kernel_end = .;
 }
