@@ -11,7 +11,8 @@ _start:
     mov %eax, %edi  # Multiboot2 magic
     mov %ebx, %esi  # Multiboot2 info pointer
 
-    # Verify multiboot2 magic
+    # Verify multiboot2 magic 
+    # (Multiboot 2 compliant kernels used the magic number 0xE85250D6, and Multiboot-compliant bootloaders report themselves with magic number 0x36D76289)
     cmp $0x36D76289, %edi
     jne multiboot_error
 
@@ -40,10 +41,10 @@ multiboot_error:
 
 # Set up identity mapping for first 2MB + higher half mapping
 setup_page_tables:
-    # Zero out page tables
+    # Zero out all three page tables (PML4, PDPT, PD)
     mov $boot_pml4, %edi
     mov $0, %eax
-    mov $4096, %ecx
+    mov $3072, %ecx  # 3 pages * 4096 bytes / 4 = 3072 dwords
     rep stosl
 
     # PML4[0] -> boot_pdpt (identity map first 2MB)
@@ -53,6 +54,7 @@ setup_page_tables:
     mov %eax, (%edi)
 
     # PML4[511] -> boot_pdpt (higher half at 0xFFFFFFFF80000000)
+    # Note: Same PDPT for both identity and higher half for simplicity
     mov $boot_pml4, %edi
     add $4088, %edi  # 511 * 8
     mov $boot_pdpt, %eax
@@ -83,10 +85,10 @@ enable_paging:
     or $(1 << 5), %eax
     mov %eax, %cr4
 
-    # Enable long mode (EFER.LME = 1)
+    # Enable long mode (EFER.LME = 1) and NX bit (EFER.NXE = 1)
     mov $0xC0000080, %ecx
     rdmsr
-    or $(1 << 8), %eax
+    or $(1 << 8) | (1 << 11), %eax  # LME + NXE
     wrmsr
 
     # Enable paging (CR0.PG = 1)
@@ -109,7 +111,7 @@ long_mode_start:
     # Set up 64-bit stack
     mov $stack_top, %rsp
 
-    # Restore multiboot info (sign-extend esi to rsi)
+    # Restore multiboot info (zero-extend esi to rsi)
     mov %esi, %esi
     push %rsi
 
@@ -128,7 +130,7 @@ long_mode_start:
 .section .rodata
 .align 16
 gdt64:
-    .quad 0                         # Null descriptor
+    .quad 0                        # Null descriptor
     .quad 0x00AF9A000000FFFF       # Code segment (64-bit)
     .quad 0x00AF92000000FFFF       # Data segment (64-bit)
 gdt64_pointer:
