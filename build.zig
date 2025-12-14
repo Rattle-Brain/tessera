@@ -26,7 +26,9 @@ pub fn build(b: *std.Build) void {
 
 
     // Create the output directory (iso/boot)
+    const sleep = b.addSystemCommand(&.{"sleep", "0.1"});
     const iso_dir = b.addSystemCommand(&.{"mkdir", "-p", "iso/boot/grub"});
+    iso_dir.step.dependOn(&sleep.step);
 
     const copy_kernel = b.addSystemCommand(&.{
         "cp",
