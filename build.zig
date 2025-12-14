@@ -23,4 +23,35 @@ pub fn build(b: *std.Build) void {
     kernel.addAssemblyFile(b.path("src/boot/boot.S"));
 
     b.installArtifact(kernel);
+
+
+    // Create the output directory (iso/boot)
+    const iso_dir = b.addSystemCommand(&.{"mkdir", "-p", "iso/boot/grub"});
+
+    const copy_kernel = b.addSystemCommand(&.{
+        "cp",
+        b.getInstallPath(.bin, "tessera.elf"),
+        "iso/boot/tessera.elf"
+    });
+
+    copy_kernel.step.dependOn(&kernel.step);
+    copy_kernel.step.dependOn(&iso_dir.step);
+
+    const copy_grub_cfg = b.addSystemCommand(&.{
+        "cp",
+        "grub.cfg",
+        "iso/boot/grub/grub.cfg"
+    });
+    copy_grub_cfg.step.dependOn(&iso_dir.step);
+
+    const make_iso = b.addSystemCommand(&.{
+        "grub-mkrescue",
+        "-o",
+        "zig-out/tessera.iso",
+        "iso/"
+    });
+    make_iso.step.dependOn(&copy_kernel.step);
+    make_iso.step.dependOn(&copy_grub_cfg.step);
+
+    b.default_step.dependOn(&make_iso.step);
 }
