@@ -19,6 +19,7 @@ header_end:
 .code32
 .global _start
 .type _start, @function
+.extern kmain
 
 _start:
     # Disable interrupts

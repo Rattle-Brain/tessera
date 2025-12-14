@@ -36,18 +36,19 @@ Requirements:
 - Zig compiler (0.15.2 or later)
 - GNU Make (optional)
 - QEMU (for testing)
+- grub-mkrescue
 
 ```bash
 # Build the kernel
 zig build
-
-# The kernel ELF will be in zig-out/bin/tessera.elf
 ```
+
+> This will generate an `iso/` directory with all the files, and the `tessera.iso` image in the `zig-out/` directory
 
 ## Boot Options
 
-### Limine Bootloader
-Copy `tessera.elf` and `limine.cfg` to a boot partition and install Limine.
+### Limine
+Limine support has been cancelled. It would be way too complicated to start by supporting multiple booting protocols.
 
 ### Multiboot2
 The kernel includes a Multiboot2 header and can be booted by any Multiboot2-compliant bootloader (GRUB2, etc.)
@@ -56,7 +57,11 @@ The kernel includes a Multiboot2 header and can be booted by any Multiboot2-comp
 
 ```bash
 # Test with QEMU (using multiboot2)
-qemu-system-x86_64 -kernel zig-out/bin/tessera.elf -serial stdio
+qemu-system-x86_64 \
+  -cdrom zig-out/tessera.iso \
+  -m 512M \
+  -serial stdio \
+  -boot d
 ```
 
 ## Features

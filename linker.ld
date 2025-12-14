@@ -8,7 +8,7 @@ SECTIONS
     /* Multiboot header must be in first 8KB */
     .boot :
     {
-        *(.multiboot)
+        *(.multiboot2)
     }
 
     /* Text section (code) */
