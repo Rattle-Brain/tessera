@@ -83,7 +83,8 @@ export fn interruptHandler(frame: *const InterruptFrame) void {
 
 // We need a way to get the addresses of our assembly stubs to load into the IDT.
 // We'll create an array of them in assembly and import it here.
-extern const isr_stub_table: [256]u64;
+// Note: Only 48 stubs are defined (0-31 CPU exceptions + 32-47 IRQs)
+extern const isr_stub_table: [48]u64;
 
 // This function can now be used by your IDT setup code.
 pub fn getHandler(interrupt: usize) u64 {

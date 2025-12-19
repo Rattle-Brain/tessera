@@ -120,9 +120,12 @@ isr_common_stub:
     
     // Pop the interrupt number and error code pushed by our stubs
     addq $16, %rsp
-    
-    // Re-enable interrupts and return from interrupt
-    sti
+
+    // Return from interrupt
+    // Note: iretq restores RFLAGS which includes the IF (interrupt flag),
+    // so interrupts will be re-enabled automatically if they were enabled before.
+    // DO NOT use sti here - it would enable interrupts before iretq completes,
+    // potentially causing stack corruption from nested interrupts.
     iretq
 
 // Append this to the end of isr.S

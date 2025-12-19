@@ -8,7 +8,7 @@ None. It compiles well.
 
 ## Code Correctness Issues
 
-1. Boot Code - Architecture Mismatch (boot/boot.S:1-29)
+1. Boot Code - Architecture Mismatch (boot/boot.S:1-29) -- **FIXED**
 
 - Using x86_64 registers (%rsp, %rbx) but Multiboot2 starts in 32-bit protected mode
 - Need to set up long mode and paging before using 64-bit instructions
