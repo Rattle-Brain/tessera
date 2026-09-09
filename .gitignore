@@ -1,3 +1,5 @@
 .zig-cache/
 zig-out/
 *.o
+# Stale ISO staging tree; `zig build iso` now stages into the build cache.
+iso/

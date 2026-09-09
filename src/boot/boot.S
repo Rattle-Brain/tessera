@@ -1,141 +1,275 @@
-.section .multiboot2
-.align 8
+/*
+ * Tessera bootstrap: Multiboot entry -> long mode -> kmain().
+ *
+ * The bootloader hands us 32-bit protected mode, paging disabled, interrupts
+ * disabled, and a flat GDT it owns. Everything below builds the minimum
+ * required to run 64-bit Zig code:
+ *
+ *   1. zero .bss           (do not assume the loader did it)
+ *   2. verify CPUID/long mode
+ *   3. identity map the low 4 GiB with 2 MiB pages
+ *   4. PAE + EFER.LME + CR0.PG, then a far jump into a 64-bit code segment
+ *   5. call kmain(magic, mb_info)
+ */
 
-multiboot_header:
-    .long 0xE85250D6          # Multiboot2 header magic
-    .long 0                   # Architecture (0 = i386)
-    .long header_end - multiboot_header
-    .long -(0xE85250D6 + 0 + (header_end - multiboot_header))
+/*
+ * NOTE: the ",\"a\"" is load-bearing. Without the SHF_ALLOC flag GAS gives a
+ * custom-named section no flags at all, the linker keeps it out of every
+ * PT_LOAD segment, and the bootloader then finds no Multiboot header in the
+ * loaded image and refuses to boot.
+ */
+.section .multiboot, "a", @progbits
 
-    # End tag
-    .align 8
-    .short 0                  # type = end
-    .short 0                  # flags
-    .long 8                   # size
+/* ---- Multiboot 1 header (0x1BADB002) ------------------------------------
+ * Only here so that `qemu-system-x86_64 -kernel` can boot the ELF directly:
+ * QEMU's built-in loader implements Multiboot 1 but not Multiboot 2.
+ */
+.set MB1_MAGIC, 0x1BADB002
+.set MB1_FLAGS, 0x00000003          /* align modules to 4K | provide meminfo */
 
-header_end:
+.balign 4
+mb1_header:
+    .long MB1_MAGIC
+    .long MB1_FLAGS
+    .long -(MB1_MAGIC + MB1_FLAGS)
 
-.section .text
+/* ---- Multiboot 2 header (0xE85250D6) ---------------------------------- */
+.set MB2_MAGIC, 0xE85250D6
+.set MB2_ARCH,  0                   /* 0 = i386 protected mode. This is the
+                                     * state the loader must enter us in, not
+                                     * the width of the kernel, so 0 is correct
+                                     * for an x86_64 kernel too. */
+
+.balign 8
+mb2_header:
+    .long MB2_MAGIC
+    .long MB2_ARCH
+    .long mb2_header_end - mb2_header
+    .long -(MB2_MAGIC + MB2_ARCH + (mb2_header_end - mb2_header))
+
+    /* End tag */
+    .balign 8
+    .short 0                        /* type = end */
+    .short 0                        /* flags   */
+    .long  8                        /* size    */
+mb2_header_end:
+
+
+.section .text, "ax", @progbits
 .code32
 .global _start
 .type _start, @function
-
 _start:
-    # Disable interrupts
     cli
-
-    # Save multiboot2 magic and info pointer (32-bit registers)
-    mov %eax, %edi  # Multiboot2 magic
-    mov %ebx, %esi  # Multiboot2 info pointer
-
-    # Verify multiboot2 magic 
-    # (Multiboot 2 compliant kernels used the magic number 0xE85250D6, and Multiboot-compliant bootloaders report themselves with magic number 0x36D76289)
-    cmp $0x36D76289, %eax
-    jne multiboot_error
-
-    # Set up minimal stack for 32-bit mode
-    mov $stack_top, %esp
-
-    # Clear direction flag
     cld
 
-    # Set up paging for long mode
-    call setup_page_tables
-    call enable_paging
+    /* Stash the Multiboot handoff registers in callee-preserved registers.
+     * ebp = magic, edx = info pointer. Both survive the .bss wipe below,
+     * which clobbers eax/ecx/edi. */
+    movl %eax, %ebp
+    movl %ebx, %edx
 
-    # Load GDT
-    lgdt gdt64_pointer
+    /* The stack lives in .bss; it is safe to point at it before the wipe
+     * because nothing has been pushed yet. */
+    movl $stack_top, %esp
 
-    # Far jump to 64-bit code segment
-    ljmp $0x08, $long_mode_start
-
-multiboot_error:
-    # Hang on multiboot error
-    cli
-1:
-    hlt
-    jmp 1b
-
-# Set up identity mapping for first 2MB + higher half mapping
-setup_page_tables:
-    # Zero out all three page tables (PML4, PDPT, PD)
-    mov $boot_pml4, %edi
-    mov $0, %eax
-    mov $3072, %ecx  # 3 pages * 4096 bytes / 4 = 3072 dwords
+    /* ---- 1. Zero .bss ------------------------------------------------- */
+    movl $__bss_start, %edi
+    movl $__bss_end, %ecx
+    subl %edi, %ecx
+    shrl $2, %ecx                   /* linker script aligns __bss_end to 8 */
+    xorl %eax, %eax
     rep stosl
 
-    # PML4[0] -> boot_pdpt (identity map first 2MB)
-    mov $boot_pml4, %edi
-    mov $boot_pdpt, %eax
-    or $0b11, %eax  # Present + Writable
-    mov %eax, (%edi)
+    /* Now that .bss is clean, park the handoff values there. */
+    movl %ebp, mb_magic
+    movl %edx, mb_info
 
-    # PML4[511] -> boot_pdpt (higher half at 0xFFFFFFFF80000000)
-    # Note: Same PDPT for both identity and higher half for simplicity
-    mov $boot_pml4, %edi
-    add $4088, %edi  # 511 * 8
-    mov $boot_pdpt, %eax
-    or $0b11, %eax
-    mov %eax, (%edi)
+    /* ---- 2. Validate the handoff and the CPU -------------------------- */
+    cmpl $0x36D76289, %ebp          /* Multiboot 2 */
+    je 1f
+    cmpl $0x2BADB002, %ebp          /* Multiboot 1 */
+    je 1f
+    movl $err_no_multiboot, %esi
+    jmp boot_fail32
+1:
+    call check_long_mode
 
-    # PDPT[0] -> boot_pd
-    mov $boot_pdpt, %edi
-    mov $boot_pd, %eax
-    or $0b11, %eax
-    mov %eax, (%edi)
+    /* ---- 3/4. Paging and long mode ------------------------------------ */
+    call setup_page_tables
+    call enable_long_mode
 
-    # PD[0] -> 2MB huge page at 0x0
-    mov $boot_pd, %edi
-    mov $0x0, %eax
-    or $0b10000011, %eax  # Present + Writable + Huge
-    mov %eax, (%edi)
+    lgdt gdt64_pointer
+    ljmp $0x08, $long_mode_start
+
+
+/*
+ * Confirm the CPU implements extended CPUID leaves and long mode.
+ * Clobbers eax/ebx/ecx/edx (edx is reloaded from mb_info by the caller's
+ * later use of memory, so it must not be relied on after this point).
+ */
+check_long_mode:
+    /* Extended leaves present? */
+    movl $0x80000000, %eax
+    cpuid
+    cmpl $0x80000001, %eax
+    jb 1f
+
+    /* CPUID.80000001h:EDX.LM (bit 29) */
+    movl $0x80000001, %eax
+    cpuid
+    testl $(1 << 29), %edx
+    jz 1f
+    ret
+1:
+    movl $err_no_long_mode, %esi
+    jmp boot_fail32
+
+
+/*
+ * Identity map [0, 4 GiB) using 2 MiB pages:
+ *   PML4[0]      -> boot_pdpt
+ *   PDPT[0..3]   -> boot_pd[0..3]
+ *   boot_pd[i]   -> 2 MiB page at i * 2 MiB
+ *
+ * 4 GiB (rather than the single 2 MiB page this used to map) means the kernel
+ * keeps running no matter where in low memory it was linked, and it also covers
+ * the VGA window and the usual PCI MMIO hole. The tables are already zeroed by
+ * the .bss wipe, so only the live entries are written.
+ */
+setup_page_tables:
+    /* PML4[0] -> boot_pdpt */
+    movl $boot_pdpt, %eax
+    orl  $0x03, %eax                /* present | writable */
+    movl %eax, boot_pml4
+
+    /* PDPT[0..3] -> the four page directories */
+    movl $boot_pdpt, %edi
+    movl $boot_pd, %eax
+    orl  $0x03, %eax
+    movl $4, %ecx
+1:
+    movl %eax, (%edi)
+    addl $4096, %eax                /* next page directory */
+    addl $8, %edi
+    loop 1b
+
+    /* 2048 * 2 MiB = 4 GiB of huge pages */
+    movl $boot_pd, %edi
+    movl $0x83, %eax                /* present | writable | page size (2 MiB) */
+    movl $2048, %ecx
+1:
+    movl %eax, (%edi)
+    addl $0x200000, %eax
+    addl $8, %edi
+    loop 1b
 
     ret
 
-enable_paging:
-    # Load PML4 into CR3
-    mov $boot_pml4, %eax
-    mov %eax, %cr3
 
-    # Enable PAE (CR4.PAE = 1)
-    mov %cr4, %eax
-    or $(1 << 5), %eax
-    mov %eax, %cr4
+enable_long_mode:
+    /* CR3 = PML4 */
+    movl $boot_pml4, %eax
+    movl %eax, %cr3
 
-    # Enable long mode (EFER.LME = 1) and NX bit (EFER.NXE = 1)
-    mov $0xC0000080, %ecx
+    /* CR4.PAE (bit 5) is mandatory for long mode. */
+    movl %cr4, %eax
+    orl  $(1 << 5), %eax
+    movl %eax, %cr4
+
+    /* IA32_EFER.LME (bit 8) | .NXE (bit 11) */
+    movl $0xC0000080, %ecx
     rdmsr
-    or $(1 << 8) | (1 << 11), %eax  # LME + NXE
+    orl  $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
-    # Enable paging (CR0.PG = 1)
-    mov %cr0, %eax
-    or $(1 << 31), %eax
-    mov %eax, %cr0
+    /* CR0.PG (bit 31) | CR0.WP (bit 16) */
+    movl %cr0, %eax
+    orl  $((1 << 31) | (1 << 16)), %eax
+    movl %eax, %cr0
 
     ret
+
+
+/*
+ * Fatal error before we have any drivers: paint a message into the VGA text
+ * buffer and push it out COM1, then stop. esi = NUL-terminated string.
+ * Paging is still off here, so 0xB8000 is directly addressable.
+ */
+boot_fail32:
+    /* Minimal 38400-8N1 COM1 setup so the message also reaches -serial. */
+    movl $0x3F9, %edx               /* IER  */
+    xorl %eax, %eax
+    outb %al, %dx
+    movl $0x3FB, %edx               /* LCR: enable DLAB */
+    movb $0x80, %al
+    outb %al, %dx
+    movl $0x3F8, %edx               /* divisor low = 3 */
+    movb $0x03, %al
+    outb %al, %dx
+    movl $0x3F9, %edx               /* divisor high = 0 */
+    xorl %eax, %eax
+    outb %al, %dx
+    movl $0x3FB, %edx               /* LCR: 8N1 */
+    movb $0x03, %al
+    outb %al, %dx
+
+    movl $0xB8000, %edi
+    movl $0x4F00, %ebx              /* white on red */
+1:
+    movzbl (%esi), %eax
+    testb %al, %al
+    jz 3f
+
+    /* VGA cell */
+    orl  %ebx, %eax
+    movw %ax, (%edi)
+    addl $2, %edi
+
+    /* COM1, spinning on LSR.THRE (bit 5) */
+    movl $0x3FD, %edx
+2:
+    inb  %dx, %al
+    testb $0x20, %al
+    jz 2b
+    movzbl (%esi), %eax
+    movl $0x3F8, %edx
+    outb %al, %dx
+
+    addl $1, %esi
+    jmp 1b
+3:
+    cli
+4:
+    hlt
+    jmp 4b
+
 
 .code64
 long_mode_start:
-    # Load segment registers
-    mov $0x10, %ax
-    mov %ax, %ds
-    mov %ax, %es
-    mov %ax, %fs
-    mov %ax, %gs
-    mov %ax, %ss
+    /* Reload the data segment selectors from our own GDT. */
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+    movw %ax, %ss
 
-    # Set up 64-bit stack
-    mov $stack_top, %rsp
+    movq $stack_top, %rsp
+    xorq %rbp, %rbp
 
-    # Restore multiboot info (zero-extend esi to rsi)
-    mov %esi, %esi
-    push %rsi
-
-    # Call the Zig kernel main function
+    /*
+     * System V AMD64: first two args in rdi/rsi, and rsp must be 16-byte
+     * aligned *at the call site*. stack_top is 16-byte aligned and nothing has
+     * been pushed, so calling directly is correct. (Pushing an argument here,
+     * as this code used to, both misaligned the stack and put the argument
+     * somewhere kmain never looks.)
+     */
+    movl mb_magic(%rip), %edi       /* zero-extends into rdi */
+    movl mb_info(%rip), %esi        /* zero-extends into rsi */
     call kmain
 
-    # Hang if kmain returns
+    /* kmain is noreturn; if it ever does return, stop hard. */
     cli
 1:
     hlt
@@ -143,29 +277,45 @@ long_mode_start:
 
 .size _start, . - _start
 
-# Temporary GDT for 64-bit mode
-.section .rodata
-.align 16
+
+.section .rodata, "a", @progbits
+err_no_multiboot:
+    .asciz "FATAL: not loaded by a Multiboot-compliant bootloader"
+err_no_long_mode:
+    .asciz "FATAL: CPU does not support x86_64 long mode"
+
+/* Minimal long-mode GDT: null, 64-bit ring 0 code, ring 0 data.
+ * gdt.zig installs the real one (with a TSS) once Zig code is running. */
+.balign 16
 gdt64:
-    .quad 0                        # Null descriptor
-    .quad 0x00AF9A000000FFFF       # Code segment (64-bit)
-    .quad 0x00AF92000000FFFF       # Data segment (64-bit)
+    .quad 0                         /* null */
+    .quad 0x00AF9A000000FFFF        /* 0x08: code64, present, ring 0, L=1 */
+    .quad 0x00CF92000000FFFF        /* 0x10: data,   present, ring 0       */
 gdt64_pointer:
     .word gdt64_pointer - gdt64 - 1
     .quad gdt64
 
-# Page tables (aligned to 4KB)
-.section .bss
-.align 4096
+
+.section .bss, "aw", @nobits
+
+/* Multiboot handoff values, saved before we clobber the registers. */
+.balign 8
+mb_magic:
+    .skip 8
+mb_info:
+    .skip 8
+
+/* Boot page tables. Must be 4 KiB aligned; contents come from the .bss wipe. */
+.balign 4096
 boot_pml4:
     .skip 4096
 boot_pdpt:
     .skip 4096
 boot_pd:
-    .skip 4096
+    .skip 4096 * 4                  /* four directories = 4 GiB of 2 MiB pages */
 
-# Reserve stack space
-.align 16
+/* Boot/kernel stack. stack_top must be 16-byte aligned for the SysV ABI. */
+.balign 16
 stack_bottom:
-    .skip 16384  # 16 KiB stack
+    .skip 65536                     /* 64 KiB */
 stack_top:

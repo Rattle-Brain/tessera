@@ -1,11 +1,13 @@
-// Interrupt Descriptor Table for x86_64
+//! Interrupt Descriptor Table for x86_64.
 
 const isr = @import("isr.zig");
 const pic = @import("pic.zig");
+const gdt = @import("gdt.zig");
 
-const IdtEntry = packed struct {
+const Entry = packed struct(u128) {
     offset_low: u16,
     selector: u16,
+    /// Interrupt Stack Table index (0 = keep the current stack).
     ist: u8,
     type_attr: u8,
     offset_mid: u16,
@@ -13,55 +15,82 @@ const IdtEntry = packed struct {
     reserved: u32,
 };
 
-const IdtPointer = packed struct {
+const Pointer = packed struct(u80) {
     limit: u16,
     base: u64,
 };
 
-var idt: [256]IdtEntry align(16) = undefined;
-var idt_ptr: IdtPointer = undefined;
+comptime {
+    if (@bitSizeOf(Entry) != 128) @compileError("IDT entry must be 16 bytes");
+    if (@bitSizeOf(Pointer) != 80) @compileError("IDTR must be 10 bytes");
+}
 
-// Number of ISR stubs we have defined in isr.S
-const ISR_COUNT = 48;
+/// present | ring 0 | 64-bit interrupt gate. An *interrupt* gate (0xE) clears
+/// IF on entry; a trap gate (0xF) would not, and would let an IRQ re-enter the
+/// handler on its own stack.
+const GATE_INTERRUPT: u8 = 0x8E;
+
+pub const VECTOR_COUNT = 256;
+
+var idt: [VECTOR_COUNT]Entry align(16) = undefined;
+var idt_ptr: Pointer align(16) = undefined;
 
 pub fn init() void {
-    // First, remap the PIC so IRQs 0-15 map to vectors 32-47
-    // This MUST happen before we enable interrupts!
+    // Remap the PIC before anything can fire: out of reset, IRQ 0-7 are mapped
+    // onto vectors 8-15, which collide with the CPU's own exception vectors.
     pic.init();
 
-    // Initialize the first 48 IDT entries with our handlers
-    for (0..ISR_COUNT) |i| {
-        const handler = isr.getHandler(i);
-        setGate(&idt[i], handler, 0x08, 0x8E);
+    for (0..VECTOR_COUNT) |i| {
+        if (i < isr.STUB_COUNT) {
+            setGate(i, isr.getHandler(i), GATE_INTERRUPT, 0);
+        } else {
+            // Not present: taking one of these raises #GP (13) instead of
+            // jumping through a garbage descriptor.
+            setGate(i, 0, 0x00, 0);
+        }
     }
 
-    // Set remaining entries as "not present" (type_attr = 0)
-    for (ISR_COUNT..256) |i| {
-        setGate(&idt[i], 0, 0x08, 0x00);
-    }
-
-    idt_ptr.limit = @sizeOf(@TypeOf(idt)) - 1;
-    idt_ptr.base = @intFromPtr(&idt);
+    idt_ptr = .{
+        .limit = @sizeOf(@TypeOf(idt)) - 1,
+        .base = @intFromPtr(&idt),
+    };
 
     load();
 }
 
-fn setGate(entry: *IdtEntry, handler: u64, selector: u16, type_attr: u8) void {
-    entry.offset_low = @truncate(handler & 0xFFFF);
-    entry.selector = selector;
-    entry.ist = 0;
-    entry.type_attr = type_attr;
-    entry.offset_mid = @truncate((handler >> 16) & 0xFFFF);
-    entry.offset_high = @truncate((handler >> 32) & 0xFFFFFFFF);
-    entry.reserved = 0;
+fn setGate(vector: usize, handler: u64, type_attr: u8, ist: u3) void {
+    idt[vector] = .{
+        .offset_low = @truncate(handler),
+        .selector = gdt.KERNEL_CODE,
+        .ist = ist,
+        .type_attr = type_attr,
+        .offset_mid = @truncate(handler >> 16),
+        .offset_high = @truncate(handler >> 32),
+        .reserved = 0,
+    };
+}
+
+/// Route a vector onto one of the TSS interrupt stacks. Pair with
+/// `tss.setInterruptStack`.
+pub fn setIst(vector: usize, ist: u3) void {
+    idt[vector].ist = ist;
 }
 
 fn load() void {
-    const ptr_addr = @intFromPtr(&idt_ptr);
-    asm volatile ("lidtq (%%rax)"
+    asm volatile ("lidt (%%rax)"
         :
-        : [_] "{rax}" (ptr_addr),
-        : .{ .rax = true }
+        : [ptr] "{rax}" (&idt_ptr),
+        : .{ .rax = true, .memory = true }
     );
-    asm volatile ("sti"); // Enable interrupts
+}
+
+/// Interrupts stay masked until the caller explicitly asks for them. `init`
+/// used to end with `sti`, which enabled IRQs from inside the IDT setup — before
+/// the rest of the kernel had finished initialising.
+pub fn enableInterrupts() void {
+    asm volatile ("sti" ::: .{ .memory = true });
+}
+
+pub fn disableInterrupts() void {
+    asm volatile ("cli" ::: .{ .memory = true });
 }

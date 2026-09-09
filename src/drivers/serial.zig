@@ -1,63 +1,70 @@
-// Serial Port Driver for debugging
+//! 16550 UART driver on COM1, used as the kernel's debug console.
 
 const port = @import("../arch/x86_64/port.zig");
 
 const COM1: u16 = 0x3F8;
 
+// Register offsets (DLAB=0 unless noted).
+const REG_DATA = 0; // also divisor low when DLAB=1
+const REG_IER = 1; // also divisor high when DLAB=1
+const REG_FCR = 2;
+const REG_LCR = 3;
+const REG_MCR = 4;
+const REG_LSR = 5;
+
+const LSR_THRE: u8 = 0x20; // transmit holding register empty
+const LSR_DATA_READY: u8 = 0x01;
+
 var initialized: bool = false;
 
 pub fn init() void {
-    // Disable interrupts
-    port.outb(COM1 + 1, 0x00);
+    initialized = false;
 
-    // Enable DLAB (set baud rate divisor)
-    port.outb(COM1 + 3, 0x80);
+    port.outb(COM1 + REG_IER, 0x00); // no interrupts
+    port.outb(COM1 + REG_LCR, 0x80); // enable DLAB
+    port.outb(COM1 + REG_DATA, 0x03); // divisor 3 -> 38400 baud
+    port.outb(COM1 + REG_IER, 0x00);
+    port.outb(COM1 + REG_LCR, 0x03); // 8 bits, no parity, 1 stop
+    port.outb(COM1 + REG_FCR, 0xC7); // FIFO on, cleared, 14-byte threshold
+    port.outb(COM1 + REG_MCR, 0x0B); // DTR + RTS + OUT2
 
-    // Set divisor to 3 (lo byte) 38400 baud
-    port.outb(COM1 + 0, 0x03);
-    port.outb(COM1 + 1, 0x00);
+    // Loopback self-test: write a byte and check it comes straight back.
+    port.outb(COM1 + REG_MCR, 0x1E);
+    port.outb(COM1 + REG_DATA, 0xAE);
+    if (port.inb(COM1 + REG_DATA) != 0xAE) return; // stays uninitialized
 
-    // 8 bits, no parity, one stop bit
-    port.outb(COM1 + 3, 0x03);
-
-    // Enable FIFO, clear them, with 14-byte threshold
-    port.outb(COM1 + 2, 0xC7);
-
-    // IRQs enabled, RTS/DSR set
-    port.outb(COM1 + 4, 0x0B);
-
-    // Set in loopback mode, test the serial chip
-    port.outb(COM1 + 4, 0x1E);
-
-    // Test serial chip (send byte 0xAE and check if serial returns same byte)
-    port.outb(COM1 + 0, 0xAE);
-
-    // Check if serial is faulty (i.e: not same byte as sent)
-    if (port.inb(COM1 + 0) != 0xAE) {
-        initialized = false;
-        return;
-    }
-
-    // If serial is not faulty set it in normal operation mode
-    port.outb(COM1 + 4, 0x0F);
+    port.outb(COM1 + REG_MCR, 0x0F); // back to normal operation
     initialized = true;
 }
 
-fn isTransmitEmpty() bool {
-    return (port.inb(COM1 + 5) & 0x20) != 0;
+fn transmitEmpty() bool {
+    return port.inb(COM1 + REG_LSR) & LSR_THRE != 0;
+}
+
+fn putRaw(c: u8) void {
+    while (!transmitEmpty()) {}
+    port.outb(COM1 + REG_DATA, c);
 }
 
 pub fn putChar(c: u8) void {
     if (!initialized) return;
-
-    while (!isTransmitEmpty()) {}
-    port.outb(COM1, c);
+    // Terminals expect CRLF; the kernel emits bare LF.
+    if (c == '\n') putRaw('\r');
+    putRaw(c);
 }
 
 pub fn writeString(str: []const u8) void {
-    for (str) |c| {
-        putChar(c);
-    }
+    if (!initialized) return;
+    for (str) |c| putChar(c);
+}
+
+pub fn dataAvailable() bool {
+    return initialized and port.inb(COM1 + REG_LSR) & LSR_DATA_READY != 0;
+}
+
+pub fn readChar() ?u8 {
+    if (!dataAvailable()) return null;
+    return port.inb(COM1 + REG_DATA);
 }
 
 pub fn isInitialized() bool {

@@ -1,105 +1,86 @@
-// 8259 PIC (Programmable Interrupt Controller) driver
-// Handles remapping of hardware IRQs to avoid conflicts with CPU exceptions
+//! 8259A PIC driver.
+//!
+//! Out of reset the master PIC maps IRQ 0-7 onto vectors 8-15, which collide
+//! with the CPU's own exception vectors (#DF, #GP, #PF...). Remapping to 32-47
+//! is the first thing that has to happen before interrupts are ever enabled.
 
 const port = @import("port.zig");
 
-// PIC I/O ports
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
 const PIC2_COMMAND: u16 = 0xA0;
 const PIC2_DATA: u16 = 0xA1;
 
-// ICW1 (Initialization Command Word 1)
-const ICW1_ICW4: u8 = 0x01; // ICW4 needed
-const ICW1_INIT: u8 = 0x10; // Initialization
+const ICW1_ICW4: u8 = 0x01;
+const ICW1_INIT: u8 = 0x10;
+const ICW4_8086: u8 = 0x01;
 
-// ICW4 (Initialization Command Word 4)
-const ICW4_8086: u8 = 0x01; // 8086/88 mode
-
-// End of Interrupt command
 const PIC_EOI: u8 = 0x20;
 
-// Remap the PIC to use interrupt vectors 32-47
-// By default, IRQ 0-7 map to vectors 8-15 (conflicts with CPU exceptions!)
-// We remap them to vectors 32-47
-pub fn init() void {
-    // Save current masks
-    const mask1 = port.inb(PIC1_DATA);
-    const mask2 = port.inb(PIC2_DATA);
+pub const VECTOR_BASE: u8 = 32;
 
-    // Start initialization sequence (ICW1)
+/// Remap both PICs and leave every line masked. Callers unmask what they are
+/// actually ready to handle (see `unmaskIRQ`); the previous version unmasked the
+/// timer and keyboard here, so IRQs could arrive mid-initialisation.
+pub fn init() void {
     port.outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4);
     port.io_wait();
     port.outb(PIC2_COMMAND, ICW1_INIT | ICW1_ICW4);
     port.io_wait();
 
-    // ICW2: Set vector offsets
-    // Master PIC: IRQ 0-7 -> vectors 32-39
-    port.outb(PIC1_DATA, 32);
+    // ICW2: vector offsets.
+    port.outb(PIC1_DATA, VECTOR_BASE); // IRQ 0-7  -> 32-39
     port.io_wait();
-    // Slave PIC: IRQ 8-15 -> vectors 40-47
-    port.outb(PIC2_DATA, 40);
+    port.outb(PIC2_DATA, VECTOR_BASE + 8); // IRQ 8-15 -> 40-47
     port.io_wait();
 
-    // ICW3: Tell Master PIC there is a slave at IRQ2 (0000 0100)
+    // ICW3: cascade wiring (slave on the master's IRQ2).
     port.outb(PIC1_DATA, 0x04);
     port.io_wait();
-    // ICW3: Tell Slave PIC its cascade identity (0000 0010)
     port.outb(PIC2_DATA, 0x02);
     port.io_wait();
 
-    // ICW4: Set 8086 mode
+    // ICW4: 8086/88 mode.
     port.outb(PIC1_DATA, ICW4_8086);
     port.io_wait();
     port.outb(PIC2_DATA, ICW4_8086);
     port.io_wait();
 
-    // Restore saved masks (or set new ones)
-    // For now, mask all interrupts except timer (IRQ0) and keyboard (IRQ1)
-    _ = mask1;
-    _ = mask2;
-    port.outb(PIC1_DATA, 0xFC); // 1111 1100 - only IRQ0 and IRQ1 enabled
-    port.outb(PIC2_DATA, 0xFF); // 1111 1111 - all slave IRQs masked
+    port.outb(PIC1_DATA, 0xFF);
+    port.outb(PIC2_DATA, 0xFF);
 }
 
-// Send End of Interrupt signal
+/// Mask every line. Use before switching to the APIC.
+pub fn disable() void {
+    port.outb(PIC1_DATA, 0xFF);
+    port.outb(PIC2_DATA, 0xFF);
+}
+
 pub fn sendEOI(irq: u8) void {
-    if (irq >= 8) {
-        // IRQ came from slave PIC, send EOI to slave first
-        port.outb(PIC2_COMMAND, PIC_EOI);
-    }
-    // Always send EOI to master
+    // A line on the slave has to be acknowledged on both chips, slave first.
+    if (irq >= 8) port.outb(PIC2_COMMAND, PIC_EOI);
     port.outb(PIC1_COMMAND, PIC_EOI);
 }
 
-// Mask (disable) a specific IRQ
 pub fn maskIRQ(irq: u8) void {
-    var io_port: u16 = undefined;
-    var irq_line: u8 = irq;
-
-    if (irq < 8) {
-        io_port = PIC1_DATA;
-    } else {
-        io_port = PIC2_DATA;
-        irq_line -= 8;
-    }
-
-    const mask = port.inb(io_port) | (@as(u8, 1) << @intCast(irq_line));
-    port.outb(io_port, mask);
+    if (irq >= 16) return;
+    const io_port: u16 = if (irq < 8) PIC1_DATA else PIC2_DATA;
+    const bit: u3 = @intCast(irq % 8);
+    port.outb(io_port, port.inb(io_port) | (@as(u8, 1) << bit));
 }
 
-// Unmask (enable) a specific IRQ
 pub fn unmaskIRQ(irq: u8) void {
-    var io_port: u16 = undefined;
-    var irq_line: u8 = irq;
+    if (irq >= 16) return;
+    const io_port: u16 = if (irq < 8) PIC1_DATA else PIC2_DATA;
+    const bit: u3 = @intCast(irq % 8);
+    port.outb(io_port, port.inb(io_port) & ~(@as(u8, 1) << bit));
 
-    if (irq < 8) {
-        io_port = PIC1_DATA;
-    } else {
-        io_port = PIC2_DATA;
-        irq_line -= 8;
+    // Anything on the slave is invisible until the cascade line itself is open.
+    if (irq >= 8) {
+        port.outb(PIC1_DATA, port.inb(PIC1_DATA) & ~@as(u8, 1 << 2));
     }
+}
 
-    const mask = port.inb(io_port) & ~(@as(u8, 1) << @intCast(irq_line));
-    port.outb(io_port, mask);
+pub fn getMask() u16 {
+    return @as(u16, port.inb(PIC1_DATA)) | (@as(u16, port.inb(PIC2_DATA)) << 8);
 }

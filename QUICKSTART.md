@@ -2,118 +2,104 @@
 
 ## Prerequisites
 
-- Zig compiler (0.11.0 or later recommended)
-- QEMU (for testing)
-- Make (optional, for convenience commands)
+- Zig 0.16.0
+- QEMU (`brew install qemu` / `apt install qemu-system-x86`)
+- Make (optional, just a wrapper around `zig build`)
 
-## Building the Kernel
+## Build
 
-### Using Zig directly:
 ```bash
-zig build
+zig build          # -> zig-out/bin/tessera.elf
 ```
 
-### Using Make:
+## Run
+
 ```bash
-make
+zig build run
 ```
 
-The kernel will be built as `zig-out/bin/tessera.elf`
-
-## Testing
-
-### Run with QEMU:
-```bash
-make run
-# or
-qemu-system-x86_64 -kernel zig-out/bin/tessera.elf -serial stdio
-```
-
-### Debug with QEMU:
-```bash
-make debug
-# Then in another terminal:
-gdb zig-out/bin/tessera.elf
-(gdb) target remote :1234
-```
+No bootloader required. Extra QEMU flags go after `--`, e.g.
+`zig build run -- -m 1G -display none`.
 
 ## Expected Output
 
-When you run the kernel, you should see:
+Both the VGA console and the serial line should show:
 
 ```
-Tessera Kernel v0.1.0
-Initializing GDT...
-GDT initialized
-Initializing IDT...
-IDT initialized
-Initializing PMM...
-PMM initialized
-
-Kernel initialization complete!
+Tessera 0.1.0
+boot: Multiboot 1, info at 0x00009500
+cpu: installing GDT/TSS
+cpu: installing IDT and remapping PIC
+mem: physical memory map
+  0x000000000000 - 0x00000009FC00  usable
+  0x00000009FC00 - 0x0000000A0000  reserved
+  0x0000000F0000 - 0x000000100000  reserved
+  0x000000100000 - 0x00001FFE0000  usable
+  0x00001FFE0000 - 0x000020000000  reserved
+  0x0000FFFC0000 - 0x000100000000  reserved
+  0x00FD00000000 - 0x010000000000  reserved
+mem: 511 MiB usable, 510 MiB free
+self-test: pmm, heap and vmm OK
+boot: initialisation complete
 ```
 
-Serial output (if connected) will show:
-```
-Kernel initialized
-```
+The exact memory map depends on how much RAM you gave QEMU. Booting via GRUB
+says `Multiboot 2` instead.
 
-## Project Structure
+After that the kernel idles in `hlt` servicing timer interrupts.
 
-```
-tessera/
-├── boot/           # Bootloader interface
-├── kernel/         # Core kernel code
-├── memory/         # Memory management
-├── arch/x86_64/    # Architecture-specific code
-└── drivers/        # Device drivers
-```
+## Debugging
 
-## Common Tasks
-
-### Clean build artifacts:
 ```bash
-make clean
-# or
-rm -rf zig-cache zig-out
+zig build run -- -s -S
+# in another terminal
+gdb zig-out/bin/tessera.elf -ex 'target remote :1234'
 ```
 
-### View build options:
+Useful QEMU flags:
+
+- `-d int,cpu_reset` — log every interrupt and every CPU reset. This is the
+  quickest way to tell a triple fault (reset loop) apart from a hang.
+- `-d guest_errors` — flag bad MMIO/port access.
+- `-display none` — headless; serial still goes to stdio.
+
+## Bootable ISO (GRUB / Multiboot 2)
+
+Needs `grub-mkrescue` and `xorriso`.
+
 ```bash
-zig build --help
+zig build iso                                            # Linux
+zig build iso -Dgrub-mkrescue=x86_64-elf-grub-mkrescue   # Homebrew
+zig build run-iso
 ```
 
 ## Troubleshooting
 
-**Build fails with Zig version error:**
-- Ensure you have Zig 0.11.0 or later
-- Update using `zigup` or download from ziglang.org
+**`qemu-system-x86_64: Cannot load x86-64 image, give a 32bit one`**
+You pointed `-kernel` at `zig-out/bin/tessera.elf` directly. QEMU's Multiboot
+loader needs an ELFCLASS32 file; use `zig build run`, which repacks it first.
 
-**QEMU doesn't start:**
-- Ensure qemu-system-x86_64 is installed
-- Try: `apt install qemu-system-x86` (Ubuntu/Debian)
-- Or: `brew install qemu` (macOS)
+**Nothing on screen and QEMU keeps restarting**
+That is a triple fault. Add `-no-reboot -d int,cpu_reset` so QEMU stops on the
+first reset and logs the CPU state that led to it.
 
-**Kernel doesn't boot:**
-- Check that the ELF file was created: `ls -lh zig-out/bin/tessera.elf`
-- Try enabling QEMU debug output: `-d int,cpu_reset`
+**`FATAL: not loaded by a Multiboot-compliant bootloader`**
+The magic value in EAX was neither `0x2BADB002` nor `0x36D76289`. Whatever
+loaded the kernel is not speaking Multiboot.
 
-## Bootloader Support
+**`FATAL: CPU does not support x86_64 long mode`**
+The emulated CPU has no `CPUID.80000001h:EDX.LM`. Drop any `-cpu` override.
 
-### Limine
-1. Copy `tessera.elf` and `limine.cfg` to boot partition
-2. Install Limine bootloader
-3. Boot from the partition
+**Kernel builds but the bootloader says there is no Multiboot header**
+Check that `.boot` is still an allocated section inside a `PT_LOAD` segment:
 
-### GRUB (Multiboot2)
-1. Copy `tessera.elf` to `/boot/`
-2. Add to GRUB config:
+```bash
+objdump --headers zig-out/bin/tessera.elf | grep boot
+objdump -p zig-out/bin/tessera.elf | head
 ```
-menuentry "Tessera" {
-    multiboot2 /boot/tessera.elf
-    boot
-}
-```
+
+A custom-named section declared without the `"a"` (SHF_ALLOC) flag is silently
+kept out of every load segment, which makes the header invisible to the loader.
 
 ## Contributing
 
